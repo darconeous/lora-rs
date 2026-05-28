@@ -65,6 +65,76 @@ const LR1110_MAX_LORA_SYMB_NUM_TIMEOUT: u8 = 248;
 // SetRx timeout argument for enabling continuous mode
 const RX_CONTINUOUS_TIMEOUT: u32 = 0xFFFFFF;
 
+/// Configuration of the LR1110's internal RF-switch driver.
+///
+/// The LR1110 can drive up to four GPIOs (DIO5, DIO6, DIO7, DIO8) as RF-switch
+/// control lines, one per radio mode. Each field is a bitmask: bit 0 = DIO5,
+/// bit 1 = DIO6, bit 2 = DIO7, bit 3 = DIO8. A `1` drives the corresponding
+/// DIO high in that mode; a `0` drives it low.
+///
+/// The exact mode-to-mask mapping is board-specific (it depends on which DIOs
+/// are wired to which switches in the antenna matching network); consult the
+/// board schematic or the matching `radio-tools` JSON.
+///
+/// Modes follow the LR11x0 datasheet "SetDioAsRfSwitch" command:
+/// * `standby`   — applied while the chip is idle.
+/// * `rx`        — sub-GHz receive.
+/// * `tx`        — sub-GHz transmit on the low-power PA.
+/// * `tx_hp`     — sub-GHz transmit on the high-power PA (LR1110 / LR1120).
+/// * `tx_hf`     — 2.4 GHz transmit (LR1120 / LR1121; leave 0 on LR1110).
+/// * `gnss`      — applied while the GNSS receiver is running.
+/// * `wifi`      — applied while the WiFi sniffer is running.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RfSwitchConfig {
+    pub standby: u8,
+    pub rx: u8,
+    pub tx: u8,
+    pub tx_hp: u8,
+    pub tx_hf: u8,
+    pub gnss: u8,
+    pub wifi: u8,
+}
+
+impl RfSwitchConfig {
+    /// The fixed RF-switch table this driver historically sent whenever the
+    /// chip variant reported [`Lr1110Variant::use_dio2_as_rfswitch`]. Preserved
+    /// as a default so existing boards that relied on the legacy behavior keep
+    /// working; new boards should provide their actual DIO masks instead.
+    pub const fn legacy_dio2_as_rf_switch() -> Self {
+        Self {
+            standby: 0x00,
+            rx:      0x01,
+            tx:      0x02,
+            tx_hp:   0x02,
+            tx_hf:   0x00,
+            gnss:    0x00,
+            wifi:    0x00,
+        }
+    }
+
+    /// Encode this configuration as the SPI byte sequence for the LR11x0
+    /// `SetDioAsRfSwitch` command (opcode + enable byte + the seven mode masks).
+    pub(crate) fn to_command_bytes(self) -> [u8; 10] {
+        let op = SystemOpCode::SetDioAsRfSwitch.bytes();
+        // RadioLib derives the "enable" byte from which of DIO5..DIO8 are used
+        // anywhere in the mode table. The per-mode masks are fixed-position
+        // bitfields (bit 0 = DIO5 .. bit 3 = DIO8), so the correct enable set
+        // is the union of all configured mode masks, not a hardcoded 0x01.
+        let enable = (self.standby
+            | self.rx
+            | self.tx
+            | self.tx_hp
+            | self.tx_hf
+            | self.gnss
+            | self.wifi)
+            & 0x0F;
+        [
+            op[0], op[1], enable,
+            self.standby, self.rx, self.tx, self.tx_hp, self.tx_hf, self.gnss, self.wifi,
+        ]
+    }
+}
+
 /// Configuration for LR1110-based boards
 pub struct Config<C: Lr1110Variant> {
     /// LoRa chip variant on this board
@@ -75,6 +145,12 @@ pub struct Config<C: Lr1110Variant> {
     pub use_dcdc: bool,
     /// Whether to boost receive
     pub rx_boost: bool,
+    /// Optional board-specific RF-switch DIO mapping. When `Some`, the LR1110's
+    /// `SetDioAsRfSwitch` command is sent during `init_lora` with these masks,
+    /// overriding the legacy hardcoded defaults. The configuration is reapplied
+    /// on every chip reset because the LR1110 does not preserve it across
+    /// resets.
+    pub rf_switch: Option<RfSwitchConfig>,
 }
 
 /// Base for the RadioKind implementation for the LR1110 chip kind and board type
@@ -173,7 +249,12 @@ where
     /// Read data from the RX buffer
     async fn read_buffer(&mut self, offset: u8, length: u8, buffer: &mut [u8]) -> Result<(), RadioError> {
         let opcode = RegMemOpCode::ReadBuffer8.bytes();
-        let header = [opcode[0], opcode[1], offset, 0x00];
+        // Match RadioLib's LR11x0 READ_BUFFER framing: the command request is
+        // `<opcode_hi><opcode_lo><offset><len>`, then the chip returns Stat1
+        // followed by `len` payload bytes. Using `<offset><dummy>` here caused
+        // valid packets to decode into all-zero payloads even though
+        // GetRxBufferStatus reported plausible lengths and offsets.
+        let header = [opcode[0], opcode[1], offset, length];
         self.intf.read(&header, &mut buffer[..length as usize]).await
     }
 
@@ -381,12 +462,21 @@ where
     /// explicitly if you want to use system functions (crypto, RNG, GNSS, WiFi)
     /// without initializing LoRa mode.
     pub async fn init_system(&mut self) -> Result<(), RadioError> {
-        // DC-DC regulator setup (default is LDO)
-        if self.config.use_dcdc {
-            let opcode = SystemOpCode::SetRegMode.bytes();
-            let cmd = [opcode[0], opcode[1], RegulatorMode::Dcdc.value()];
-            self.write_command(&cmd).await?;
-        }
+        // Always explicitly set the regulator mode rather than relying on
+        // post-reset default. The LR1110's regulator setting can persist
+        // across warm resets — if some earlier firmware put the chip into
+        // DCDC and the board can't support it (no external inductor),
+        // subsequent firmware that "skips" SetRegMode leaves the chip stuck
+        // in broken DCDC. RadioLib's `setRegulatorLDO()` is called
+        // unconditionally for exactly this reason.
+        let regulator = if self.config.use_dcdc {
+            RegulatorMode::Dcdc
+        } else {
+            RegulatorMode::Ldo
+        };
+        let opcode = SystemOpCode::SetRegMode.bytes();
+        let cmd = [opcode[0], opcode[1], regulator.value()];
+        self.write_command(&cmd).await?;
 
         // DIO3 acting as TCXO controller
         if let Some(voltage) = self.config.tcxo_ctrl {
@@ -408,13 +498,30 @@ where
             ];
             self.write_command(&cmd).await?;
 
-            // Re-run calibration now that chip knows it's running from TCXO
-            let cal_opcode = SystemOpCode::Calibrate.bytes();
-            let cal_cmd = [cal_opcode[0], cal_opcode[1], 0b0111_1111];
-            self.write_command(&cal_cmd).await?;
         }
 
+        // Match RadioLib's LR11x0 config path: calibrate all blocks with the
+        // documented 6-bit mask, regardless of whether TCXO control is used.
+        let cal_opcode = SystemOpCode::Calibrate.bytes();
+        let cal_cmd = [cal_opcode[0], cal_opcode[1], 0x3F];
+        self.write_command(&cal_cmd).await?;
+
+        // Match RadioLib's LR11x0 config path by choosing a known fallback
+        // mode, clearing any stale IRQ state, disabling routed IRQs until RX
+        // is staged, and keeping DIOs driven in sleep.
+        self.set_rx_tx_fallback_mode(FallbackMode::StandbyRc).await?;
+        self.clear_all_irq().await?;
+        self.set_irq_params(None).await?;
+        self.drive_dio_in_sleep_mode(true).await?;
+
         Ok(())
+    }
+
+    /// Keep DIO states driven while the chip is in sleep mode.
+    pub async fn drive_dio_in_sleep_mode(&mut self, enable: bool) -> Result<(), RadioError> {
+        let opcode = SystemOpCode::DriveDioInSleepMode.bytes();
+        let cmd = [opcode[0], opcode[1], if enable { 0x01 } else { 0x00 }];
+        self.write_command(&cmd).await
     }
 
     /// Wake up the LR1110 from sleep mode
@@ -500,11 +607,13 @@ where
     /// Get the system status (stat1, stat2, irq_status)
     ///
     /// This performs a direct SPI read to get the status bytes that the
-    /// LR1110 automatically returns on any read operation.
+    /// LR1110 automatically returns on any read operation. Uses
+    /// `direct_read` (no stat1 skip) — `read()` is for command-response
+    /// reads and would discard stat1 as if it were a command echo, leaving
+    /// rbuffer holding stat2 / irq / garbage instead of the real stat1.
     pub async fn get_status(&mut self) -> Result<SystemStatus, RadioError> {
-        // Direct read - chip returns status bytes automatically
         let mut rbuffer = [0u8; 6];
-        self.intf.read(&[], &mut rbuffer).await?;
+        self.intf.direct_read(&mut rbuffer).await?;
 
         Ok(SystemStatus {
             stat1: Stat1::from(rbuffer[0]),
@@ -1316,22 +1425,24 @@ where
         // Initialize system (DC-DC, TCXO, calibration)
         self.init_system().await?;
 
-        // DIO2 acting as RF Switch (if configured in variant)
-        if self.config.chip.use_dio2_as_rfswitch() {
-            // LR1110 uses SetDioAsRfSwitch command with expanded configuration
-            // For now, use simple configuration
-            let opcode = SystemOpCode::SetDioAsRfSwitch.bytes();
-            let cmd = [
-                opcode[0], opcode[1], 0x01, // enable
-                0x00, // standby
-                0x01, // rx
-                0x02, // tx
-                0x02, // tx_hp
-                0x00, // tx_hf
-                0x00, // gnss
-                0x00, // wifi
-            ];
-            self.write_command(&cmd).await?;
+        // Start LoRa packet-engine setup from a clean IRQ state with no DIO
+        // routing; RX launch will program the active IRQ mapping later.
+        self.clear_all_irq().await?;
+        self.set_irq_params(None).await?;
+
+        // Reapply the LR1110's internal RF-switch table. It does not survive a
+        // chip reset, so the configuration must be sent on every init. Prefer
+        // the board-specific `Config::rf_switch` when present; otherwise fall
+        // back to the legacy fixed table for any chip variant that opts into
+        // RF-switch driving via `Lr1110Variant::use_dio2_as_rfswitch`.
+        let rf_switch = self.config.rf_switch.or_else(|| {
+            self.config
+                .chip
+                .use_dio2_as_rfswitch()
+                .then(RfSwitchConfig::legacy_dio2_as_rf_switch)
+        });
+        if let Some(sw) = rf_switch {
+            self.write_command(&sw.to_command_bytes()).await?;
         }
 
         // Enable LoRa packet engine
@@ -1339,11 +1450,12 @@ where
         let cmd = [opcode[0], opcode[1], PacketType::LoRa.value()];
         self.write_command(&cmd).await?;
 
-        // Set LoRa sync word
-        let word = convert_sync_word(sync_word);
-        let sync_opcode = RadioOpCode::SetLoRaSyncWord.bytes();
-        let sync_cmd = [sync_opcode[0], sync_opcode[1], word];
-        self.write_command(&sync_cmd).await?;
+        // Match RadioLib/MeshCore's known-good LR11x0 LoRa bringup: set the
+        // private sync word directly rather than relying only on the public
+        // network flag.
+        let opcode = RadioOpCode::SetLoRaSyncWord.bytes();
+        let cmd = [opcode[0], opcode[1], convert_sync_word(sync_word)];
+        self.write_command(&cmd).await?;
 
         // Set buffer base addresses
         self.set_tx_rx_buffer_base_address(0, 0).await?;
@@ -1662,17 +1774,20 @@ where
     async fn do_rx(&mut self, rx_mode: RxMode) -> Result<(), RadioError> {
         self.intf.iv.enable_rf_switch_rx().await?;
 
-        // Stop RX timer on preamble detection
-        let preamble_opcode = RadioOpCode::StopTimeoutOnPreamble.bytes();
-        let preamble_cmd = [preamble_opcode[0], preamble_opcode[1], 0x01];
-        self.write_command(&preamble_cmd).await?;
-
-        // Set symbol timeout
-        let num_symbols = match rx_mode {
+        // Be explicit about sync-timeout state instead of relying on reset
+        // defaults. Continuous RX should leave this at 0; bounded single-shot
+        // RX programs the requested symbol timeout.
+        let sync_timeout_symbols = match rx_mode {
+            RxMode::Single(num_symbols) => num_symbols,
             RxMode::DutyCycle(_) | RxMode::Continuous => 0,
-            RxMode::Single(n) => n,
         };
-        self.set_lora_symbol_num_timeout(num_symbols).await?;
+        self.set_lora_symbol_num_timeout(sync_timeout_symbols).await?;
+
+        // Keep the RX timeout referenced to sync/header validation rather than
+        // stopping early on preamble detection.
+        let preamble_opcode = RadioOpCode::StopTimeoutOnPreamble.bytes();
+        let preamble_cmd = [preamble_opcode[0], preamble_opcode[1], 0x00];
+        self.write_command(&preamble_cmd).await?;
 
         // Configure RX boost if enabled
         if self.config.rx_boost {
@@ -1873,11 +1988,18 @@ where
                 }
             }
             RadioMode::Receive(_) => {
-                if IrqMask::CrcError.is_set(irq_flags) || IrqMask::HeaderError.is_set(irq_flags) {
-                    debug!("CRC or Header error");
-                }
+                // Prefer RxDone over error flags — a packet that completed
+                // can still have CrcError set, which the caller decodes via
+                // get_rx_packet_status. HeaderError without RxDone means the
+                // chip abandoned the packet at header check.
                 if IrqMask::RxDone.is_set(irq_flags) {
                     return Ok(Some(IrqState::Done));
+                }
+                if IrqMask::CrcError.is_set(irq_flags) {
+                    return Err(RadioError::CrcError);
+                }
+                if IrqMask::HeaderError.is_set(irq_flags) {
+                    return Err(RadioError::HeaderError);
                 }
                 if IrqMask::Timeout.is_set(irq_flags) {
                     return Err(RadioError::ReceiveTimeout);

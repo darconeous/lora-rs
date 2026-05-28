@@ -834,15 +834,19 @@ where
                 }
             }
             RadioMode::Receive(_) => {
-                if IrqMask::HeaderError.is_set(irq_flags) {
-                    debug!("HeaderError in radio mode {}", radio_mode);
-                }
-                if IrqMask::CRCError.is_set(irq_flags) {
-                    debug!("CRCError in radio mode {}", radio_mode);
-                }
+                // Prefer RxDone — a packet that completed can still have
+                // CRCError set, which the caller decodes via packet status.
+                // HeaderError without RxDone means the chip abandoned the
+                // packet at header check.
                 if IrqMask::RxDone.is_set(irq_flags) {
                     debug!("RxDone in radio mode {}", radio_mode);
                     return Ok(Some(IrqState::Done));
+                }
+                if IrqMask::CRCError.is_set(irq_flags) {
+                    return Err(RadioError::CrcError);
+                }
+                if IrqMask::HeaderError.is_set(irq_flags) {
+                    return Err(RadioError::HeaderError);
                 }
                 if IrqMask::RxTxTimeout.is_set(irq_flags) {
                     return Err(RadioError::ReceiveTimeout);

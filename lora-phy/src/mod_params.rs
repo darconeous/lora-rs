@@ -26,6 +26,15 @@ pub enum RadioError {
     InvalidOutputPowerForFrequency,
     TransmitTimeout,
     ReceiveTimeout,
+    /// LoRa header decoded but failed its CRC. Indicates the receiver was
+    /// sync'd to an incoming frame but couldn't parse the header (likely
+    /// a modulation/CR mismatch between RX and TX, or interference during
+    /// the header). With explicit header, the chip aborts the packet — no
+    /// RxDone fires.
+    HeaderError,
+    /// Packet payload completed but failed CRC. Use this to distinguish from
+    /// a clean RX. The payload is still readable from the buffer.
+    CrcError,
     DutyCycleUnsupported,
     RngUnsupported,
 }
