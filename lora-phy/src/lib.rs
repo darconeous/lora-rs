@@ -98,6 +98,12 @@ where
         self.radio_kind.await_irq().await
     }
 
+    /// Mutable access to the underlying `RadioKind` — bring-up/diagnostic
+    /// escape hatch for chip-specific raw access.
+    pub fn radio_kind_mut(&mut self) -> &mut RK {
+        &mut self.radio_kind
+    }
+
     /// Process an IRQ event and return the new state of the radio
     ///
     /// # Warning

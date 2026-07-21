@@ -123,9 +123,11 @@ impl Sx127xVariant for Sx1276 {
         config_1 = (config_1 & 0xf1u8) | (cr << 1);
         radio.write_register(Register::RegModemConfig1, config_1).await?;
 
-        let mut ldro_agc_auto_flags = 0x00u8; // LDRO and AGC Auto both off
+        // AGC auto on (RadioLib parity — with AGC off and the LNA pinned
+        // at maximum gain, a nearby transmitter saturates the front end).
+        let mut ldro_agc_auto_flags = 0x04u8;
         if mdltn_params.low_data_rate_optimize != 0 {
-            ldro_agc_auto_flags = 0x08u8; // LDRO on and AGC Auto off
+            ldro_agc_auto_flags |= 0x08u8; // LDRO on
         }
         let mut config_3 = radio.read_register(Register::RegModemConfig3).await?;
         config_3 = (config_3 & 0xf3u8) | ldro_agc_auto_flags;
@@ -154,6 +156,35 @@ impl Sx127xVariant for Sx1276 {
 
             // for all other combinations of bandwidth / frequencies, reset to 0x03 (RegHighBwOptimize2 is automatically set by the chip)
             radio.write_register(Register::RegHighBwOptimize1, 0x03).await?;
+        }
+
+        // Errata 2.3: receiver spurious response mitigation. Program the
+        // IF frequency manually and clear AutomaticIFOn (bit 7 of
+        // RegDetectionOptimize), matching RadioLib's errataFix(). Left on
+        // the automatic IF, the receiver decodes tens of dB below its
+        // rated sensitivity. Bandwidths below 62.5 kHz additionally
+        // require the RX carrier to be offset by one bandwidth — RX/TX
+        // context isn't visible here, so those stay on the automatic IF
+        // (spurious-prone but not deaf); 500 kHz needs the automatic IF
+        // restored.
+        let manual_if = match mdltn_params.bandwidth {
+            Bandwidth::_62KHz | Bandwidth::_125KHz | Bandwidth::_250KHz => Some(0x40),
+            _ => None,
+        };
+        let detection_optimize = radio.read_register(Register::RegDetectionOptimize).await?;
+        match manual_if {
+            Some(if_freq_2) => {
+                radio
+                    .write_register(Register::RegDetectionOptimize, detection_optimize & 0x7f)
+                    .await?;
+                radio.write_register(Register::RegIfFreq2, if_freq_2).await?;
+                radio.write_register(Register::RegIfFreq1, 0x00).await?;
+            }
+            None => {
+                radio
+                    .write_register(Register::RegDetectionOptimize, detection_optimize | 0x80)
+                    .await?;
+            }
         }
 
         Ok(())

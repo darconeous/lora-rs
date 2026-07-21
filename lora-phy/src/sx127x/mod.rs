@@ -25,20 +25,19 @@ const SX1276_RSSI_OFFSET_LF: i16 = -164;
 const SX1276_RSSI_OFFSET_HF: i16 = -157;
 const SX1276_RF_MID_BAND_THRESH: u32 = 525_000_000;
 
-// Frequency synthesizer step for frequency calculation (Hz)
-// FXOSC (32 MHz) * 1000000 (Hz/MHz) / 524288 (2^19)
-const SCALE: u32 = 8;
-const STEP_SCALED: u32 = 32_000_000 >> (19 - SCALE);
+// Frequency synthesizer step: FXOSC (32 MHz) / 2^19. Computed exactly in
+// u64 with rounding — shortcut formulas that are only exact for whole and
+// half MHz values put fractional frequencies (e.g. 910.525 MHz) up to half
+// a step-quantum times 2^SCALE (~9.4 kHz) off, a significant fraction of
+// the receiver's ±BW/4 offset tolerance at narrow bandwidths.
+const FXOSC_HZ: u64 = 32_000_000;
 
 fn freq_to_pll_step(freq_in_hz: u32) -> u32 {
-    // We can use simplified integer formula which gives the same
-    // value for whole and half Mhz values ((i.e. 868.0, 868.5, 869, ...)
-    // `(freq_in_hz as f64 / 61.03515625) as u32`
-    (freq_in_hz / STEP_SCALED) << SCALE
+    ((freq_in_hz as u64 * (1 << 19) + FXOSC_HZ / 2) / FXOSC_HZ) as u32
 }
 
 fn pll_step_to_freq(pll_step: u32) -> u32 {
-    (pll_step >> SCALE) * STEP_SCALED
+    ((pll_step as u64 * FXOSC_HZ + (1 << 18)) >> 19) as u32
 }
 
 // RSSI requires linearization when SNR >= 0
@@ -123,6 +122,18 @@ where
     // Set the over current protection (mA) on the radio
     async fn set_ocp(&mut self, ocp_trim: OcpTrim) -> Result<(), RadioError> {
         self.write_register(Register::RegOcp, ocp_trim.value()).await
+    }
+
+    /// Read a raw register by address — bring-up/diagnostic use only.
+    pub async fn read_register_raw(&mut self, addr: u8) -> Result<u8, RadioError> {
+        let mut read_buffer = [0x00u8];
+        self.intf.read(&[addr & 0x7f], &mut read_buffer).await?;
+        Ok(read_buffer[0])
+    }
+
+    async fn write_register_raw(&mut self, addr: u8, value: u8) -> Result<(), RadioError> {
+        let write_buffer = [addr | 0x80, value];
+        self.intf.write(&write_buffer, false).await
     }
 }
 
@@ -324,9 +335,56 @@ where
         Ok(())
     }
 
-    // Calibrate the image rejection based on the given frequency
-    async fn calibrate_image(&mut self, _frequency_in_hz: u32) -> Result<(), RadioError> {
-        // An automatic process, but can set bit ImageCalStart in RegImageCal, when the device is in Standby mode.
+    // Calibrate the receiver chain (image rejection + wideband RSSI) at
+    // the operating frequency — Semtech reference driver's
+    // `RxChainCalibration`. The POR auto-calibration runs at the 434 MHz
+    // LF-band default; HF-band operation without a recalibration degrades
+    // image rejection, raising the effective noise floor. RegImageCal
+    // (0x3B) exists only on the FSK register page, so the chip is
+    // temporarily switched to FSK mode (LongRangeMode is only writable in
+    // sleep) and restored to LoRa standby afterwards.
+    async fn calibrate_image(&mut self, frequency_in_hz: u32) -> Result<(), RadioError> {
+        const REG_OP_MODE: u8 = 0x01;
+        const REG_FRF_MSB: u8 = 0x06;
+        const REG_PA_CONFIG: u8 = 0x09;
+        const REG_IMAGE_CAL: u8 = 0x3b; // FSK page
+        const IMAGE_CAL_START: u8 = 0x40;
+        const IMAGE_CAL_RUNNING: u8 = 0x20;
+
+        // Cut the PA during calibration (reference-driver precaution).
+        let pa_config = self.read_register_raw(REG_PA_CONFIG).await?;
+        self.write_register_raw(REG_PA_CONFIG, 0x00).await?;
+
+        // LoRa standby → LoRa sleep (LongRangeMode is only writable in
+        // sleep) → FSK sleep → FSK standby.
+        self.write_register_raw(REG_OP_MODE, LoRaMode::Sleep.value()).await?;
+        self.write_register_raw(REG_OP_MODE, 0x00).await?;
+        self.write_register_raw(REG_OP_MODE, 0x01).await?;
+
+        // Tune to the operating frequency, then run the calibration.
+        let frf = freq_to_pll_step(frequency_in_hz);
+        self.write_register_raw(REG_FRF_MSB, (frf >> 16) as u8).await?;
+        self.write_register_raw(REG_FRF_MSB + 1, (frf >> 8) as u8).await?;
+        self.write_register_raw(REG_FRF_MSB + 2, frf as u8).await?;
+
+        let cal = self.read_register_raw(REG_IMAGE_CAL).await?;
+        self.write_register_raw(REG_IMAGE_CAL, cal | IMAGE_CAL_START).await?;
+        // Datasheet: calibration completes in ~10 ms; each SPI poll is
+        // microseconds, so bound the wait generously instead of hanging
+        // forever on a wedged chip.
+        let mut spins: u32 = 0;
+        while self.read_register_raw(REG_IMAGE_CAL).await? & IMAGE_CAL_RUNNING != 0 {
+            spins += 1;
+            if spins > 100_000 {
+                break;
+            }
+        }
+
+        // FSK sleep → LoRa sleep → LoRa standby; restore the PA config.
+        self.write_register_raw(REG_OP_MODE, 0x00).await?;
+        self.write_register_raw(REG_OP_MODE, LoRaMode::Sleep.value()).await?;
+        self.write_register_raw(REG_OP_MODE, LoRaMode::Standby.value()).await?;
+        self.write_register_raw(REG_PA_CONFIG, pa_config).await?;
         Ok(())
     }
 
@@ -610,6 +668,18 @@ mod tests {
             assert_eq!(pll, (f as f64 / FREQUENCY_SYNTHESIZER_STEP) as u32);
             assert_eq!(pll_step_to_freq(pll), f);
         }
+    }
+
+    #[test]
+    fn pll_step_exact_for_fractional_frequencies() {
+        // Fractional frequencies must be programmed to the nearest PLL
+        // step (~61 Hz), not floored to a coarser grid. MeshCore US:
+        // 910.525 MHz / 61.03515625 = 14918041.6 → 14918042.
+        let pll = freq_to_pll_step(910_525_000);
+        assert_eq!(pll, 14_918_042);
+        // Round-trip error is bounded by half a synthesizer step.
+        let freq = pll_step_to_freq(pll);
+        assert!((freq as i64 - 910_525_000i64).abs() <= 31);
     }
 
     #[test]
