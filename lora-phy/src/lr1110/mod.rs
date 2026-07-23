@@ -239,10 +239,25 @@ where
         self.intf.read_with_status(write_data, read_buffer).await
     }
 
-    /// Write data to the TX buffer
-    async fn write_buffer(&mut self, offset: u8, data: &[u8]) -> Result<(), RadioError> {
+    /// Write data to the TX buffer.
+    ///
+    /// Per the LR1110 reference firmware (`lr11xx_regmem_write_buffer8`),
+    /// WriteBuffer8 does NOT take an offset parameter — the command framing
+    /// is `<opcode_hi><opcode_lo>` followed directly by the payload. The
+    /// chip writes the bytes starting at the current write pointer (which
+    /// SetTxRxBufferBaseAddress sets to 0 at init).
+    ///
+    /// Including an `offset` byte in the header turns into a phantom byte
+    /// prepended to every transmitted packet, breaking CRC on the receiver
+    /// side. Symmetric in spirit to the ReadBuffer8 fix: read takes
+    /// `<opcode><offset><len>`, write takes just `<opcode>`.
+    ///
+    /// The `_offset` parameter is kept on the signature for trait
+    /// compatibility but is intentionally unused; SetTxRxBufferBaseAddress
+    /// is the way to control write position on this chip family.
+    async fn write_buffer(&mut self, _offset: u8, data: &[u8]) -> Result<(), RadioError> {
         let opcode = RegMemOpCode::WriteBuffer8.bytes();
-        let header = [opcode[0], opcode[1], offset];
+        let header = [opcode[0], opcode[1]];
         self.intf.write_with_payload(&header, data, false).await
     }
 
@@ -1742,22 +1757,15 @@ where
         // Clear any pending IRQs (especially error flags) before TX
         self.clear_all_irq().await?;
 
-        // Reconfigure TCXO with longer timeout before TX (per SWDM001)
-        // This ensures the TCXO is stable during transmission
-        if let Some(voltage) = self.config.tcxo_ctrl {
-            // SWDM001 uses 0x000CD0 = 3280 RTC steps (~100ms) before TX
-            let tx_tcxo_timeout: u32 = 0x000CD0;
-            let tcxo_opcode = SystemOpCode::SetTcxoMode.bytes();
-            let tcxo_cmd = [
-                tcxo_opcode[0],
-                tcxo_opcode[1],
-                voltage.value(),
-                Self::timeout_1(tx_tcxo_timeout),
-                Self::timeout_2(tx_tcxo_timeout),
-                Self::timeout_3(tx_tcxo_timeout),
-            ];
-            self.write_command(&tcxo_cmd).await?;
-        }
+        // NB: do NOT reconfigure the TCXO here. SetTcxoMode programs the
+        // startup delay the chip's sequencer applies automatically every time
+        // it powers the TCXO up from an off state (Sleep / StandbyRC fallback);
+        // it is a one-time bring-up setting, not a per-operation one, and the
+        // TCXO settles in the same time regardless of whether RX or TX follows.
+        // init_system already programs the board-correct BRD_TCXO_WAKEUP_TIME.
+        // Overriding it to ~100 ms here was sticky: it survived into the next
+        // do_rx, leaving the receiver deaf for the first 100 ms of every RX that
+        // followed a TX — exactly the window in which a unicast reply arrives.
 
         // Disable timeout (0 = no timeout)
         let opcode = RadioOpCode::SetTx.bytes();
