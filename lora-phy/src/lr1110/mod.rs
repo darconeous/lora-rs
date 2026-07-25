@@ -1905,14 +1905,23 @@ where
             self.write_command(&boost_cmd).await?;
         }
 
-        // Set CAD parameters
+        // Set CAD parameters.
+        //
+        // The LR11xx needs far less sensitive detection-peak values than the
+        // SX126x: the earlier `SF + 13` heuristic (≈20 at SF7) trips CAD on
+        // noise on every check, so the channel always reads busy. These are
+        // Semtech's per-SF LR11xx CAD values as used by RadioLib
+        // (`LR11x0::startCad`), which Meshtastic/MeshCore run in the field.
         let spreading_factor_val = spreading_factor_value(mdltn_params.spreading_factor)?;
+        // Indexed by SF 5..=12.
+        const DET_PEAK: [u8; 8] = [48, 48, 50, 55, 55, 59, 61, 65];
+        let det_peak = DET_PEAK[usize::from(spreading_factor_val - 5)];
         let cad_opcode = RadioOpCode::SetCadParams.bytes();
         let cad_cmd = [
             cad_opcode[0],
             cad_opcode[1],
-            CadSymbols::_8.value(),         // CAD symbol number
-            spreading_factor_val + 13,      // CAD detection peak
+            CadSymbols::_2.value(),         // CAD symbol number
+            det_peak,                       // CAD detection peak
             10,                             // CAD detection min
             CadExitMode::StandbyRc.value(), // CAD exit mode
             0x00,                           // timeout (24-bit)
