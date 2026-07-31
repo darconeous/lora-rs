@@ -1907,11 +1907,14 @@ where
 
         // Set CAD parameters.
         //
-        // The LR11xx needs far less sensitive detection-peak values than the
-        // SX126x: the earlier `SF + 13` heuristic (≈20 at SF7) trips CAD on
-        // noise on every check, so the channel always reads busy. These are
-        // Semtech's per-SF LR11xx CAD values as used by RadioLib
-        // (`LR11x0::startCad`), which Meshtastic/MeshCore run in the field.
+        // LR11xx `CadDetPeak` is a 5.3 fixed-point correlator-peak-to-average
+        // ratio (5 MSBs integer, 3 LSBs eighths): 50 = 0x32 = ratio 6.25, the
+        // documented default (see `lr11xx_radio_cad_params_t` in Semtech's
+        // SWDR001 driver). The SX126x's `SF + 13` heuristic (≈20 at SF7) is on
+        // a different scale entirely — decoded here it is a ratio of 2.5, at
+        // the noise floor, so CAD trips on every check and the channel always
+        // reads busy. These per-SF values are RadioLib's (`LR11x0::startCad`),
+        // which Meshtastic/MeshCore run in the field.
         let spreading_factor_val = spreading_factor_value(mdltn_params.spreading_factor)?;
         // Indexed by SF 5..=12.
         const DET_PEAK: [u8; 8] = [48, 48, 50, 55, 55, 59, 61, 65];

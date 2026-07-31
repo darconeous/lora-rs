@@ -336,14 +336,20 @@ pub fn coding_rate_value(coding_rate: CodingRate) -> Result<u8, RadioError> {
     }
 }
 
-/// CAD (Channel Activity Detection) symbols
+/// CAD (Channel Activity Detection) symbols.
+///
+/// Unlike the SX126x, whose `cadSymbolNum` is a coded enum (0x00 = 1 symbol,
+/// 0x01 = 2, ...), the LR11xx `CadSymbNum` field is the literal number of
+/// symbols to observe (see `lr11xx_radio_cad_params_t::cad_symb_nb` in
+/// Semtech's SWDR001 driver). The discriminants here are therefore the
+/// symbol counts themselves.
 #[derive(Clone, Copy)]
 pub enum CadSymbols {
-    _1 = 0x00,
-    _2 = 0x01,
-    _4 = 0x02,
-    _8 = 0x03,
-    _16 = 0x04,
+    _1 = 1,
+    _2 = 2,
+    _4 = 4,
+    _8 = 8,
+    _16 = 16,
 }
 
 impl CadSymbols {
