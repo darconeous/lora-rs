@@ -2008,15 +2008,27 @@ where
                 }
             }
             RadioMode::Receive(_) => {
-                // Prefer RxDone over error flags — a packet that completed
-                // can still have CrcError set, which the caller decodes via
-                // get_rx_packet_status. HeaderError without RxDone means the
-                // chip abandoned the packet at header check.
-                if IrqMask::RxDone.is_set(irq_flags) {
-                    return Ok(Some(IrqState::Done));
-                }
+                // CrcError before RxDone: a packet whose payload CRC failed
+                // raises *both*, and its bytes are still sitting in the chip's
+                // buffer. Reporting Done first makes the CRC branch below
+                // unreachable and hands the caller a corrupt frame that looks
+                // received — PacketStatus carries only RSSI and SNR, so
+                // nothing downstream can tell the difference.
+                //
+                // The failed packet's bytes stay in the chip's buffer and
+                // this function changes no radio state, so a diagnostics
+                // path that wants them can still fetch them before re-arming
+                // — though only in continuous mode: `complete_rx`'s
+                // single-shot error path drops to standby, which takes
+                // `get_rx_result` with it.
+                //
+                // HeaderError without RxDone means the chip abandoned the
+                // packet at header check.
                 if IrqMask::CrcError.is_set(irq_flags) {
                     return Err(RadioError::CrcError);
+                }
+                if IrqMask::RxDone.is_set(irq_flags) {
+                    return Ok(Some(IrqState::Done));
                 }
                 if IrqMask::HeaderError.is_set(irq_flags) {
                     return Err(RadioError::HeaderError);

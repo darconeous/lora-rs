@@ -834,16 +834,29 @@ where
                 }
             }
             RadioMode::Receive(_) => {
-                // Prefer RxDone — a packet that completed can still have
-                // CRCError set, which the caller decodes via packet status.
+                // CRCError before RxDone: a packet whose payload CRC failed
+                // raises *both*, and its bytes are still sitting in the chip's
+                // buffer. Reporting Done first makes the CRC branch below
+                // unreachable and hands the caller a corrupt frame that looks
+                // received — PacketStatus carries only RSSI and SNR, so
+                // nothing downstream can tell the difference.
+                //
+                // The failed packet's bytes stay in the chip's buffer and
+                // this function changes no radio state, so a diagnostics
+                // path that wants them can still fetch them before re-arming
+                // — though only in continuous mode: `complete_rx`'s
+                // single-shot error path drops to standby, which takes
+                // `get_rx_result` with it.
+                //
                 // HeaderError without RxDone means the chip abandoned the
                 // packet at header check.
+                if IrqMask::CRCError.is_set(irq_flags) {
+                    debug!("CRCError in radio mode {}", radio_mode);
+                    return Err(RadioError::CrcError);
+                }
                 if IrqMask::RxDone.is_set(irq_flags) {
                     debug!("RxDone in radio mode {}", radio_mode);
                     return Ok(Some(IrqState::Done));
-                }
-                if IrqMask::CRCError.is_set(irq_flags) {
-                    return Err(RadioError::CrcError);
                 }
                 if IrqMask::HeaderError.is_set(irq_flags) {
                     return Err(RadioError::HeaderError);
@@ -895,7 +908,16 @@ where
             self.clear_irq_status().await?;
         }
 
-        if let (RadioMode::Receive(RxMode::Single(_)), Ok(Some(IrqState::Done))) = (radio_mode, &irq_state) {
+        // Errata 15.3 cleanup (stop the RTC, clear any stale event) is owed
+        // after a packet *completes* in single-shot RX. A failed payload CRC
+        // is still a completed packet — RxDone fired alongside the error
+        // flag — so it needs the same cleanup; skipping it leaves the RTC
+        // running and a stale event that can surface as a spurious timeout
+        // in a later receive. HeaderError and ReceiveTimeout are genuine
+        // non-completions and take no cleanup.
+        if matches!(radio_mode, RadioMode::Receive(RxMode::Single(_)))
+            && matches!(&irq_state, Ok(Some(IrqState::Done)) | Err(RadioError::CrcError))
+        {
             self.handle_implicit_header_mode().await?;
         }
 

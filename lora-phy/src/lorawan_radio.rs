@@ -135,6 +135,11 @@ where
             match self.lora.rx(rx_params, buf).await {
                 Ok((len, q)) => Ok(RxStatus::Rx(len as usize, RxQuality::new(q.rssi, q.snr as i8))),
                 Err(RadioError::ReceiveTimeout) => Ok(RxStatus::RxTimeout),
+                // A corrupt packet is a window that heard nothing valid, not
+                // a radio failure — same outcome as the timeout above. (The
+                // MAC would only have discarded the garbage at its MIC check
+                // back when the PHY delivered CRC-failed packets as received.)
+                Err(RadioError::CrcError) => Ok(RxStatus::RxTimeout),
                 Err(err) => Err(err.into()),
             }
         } else {
@@ -143,7 +148,17 @@ where
     }
     async fn rx_continuous(&mut self, receiving_buffer: &mut [u8]) -> Result<(usize, RxQuality), Self::PhyError> {
         if let Some(rx_params) = &self.rx_pkt_params {
-            match self.lora.rx(rx_params, receiving_buffer).await {
+            let mut result = self.lora.rx(rx_params, receiving_buffer).await;
+            // A corrupt packet is not a radio failure: the continuous
+            // receive is still armed (`complete_rx` only drops to standby
+            // for single-shot modes), so keep waiting for the next packet
+            // rather than surfacing an error for a frame the MAC would only
+            // have discarded. `complete_rx` rather than `rx` so the receiver
+            // is not re-triggered under a packet already in the air.
+            while matches!(result, Err(RadioError::CrcError)) {
+                result = self.lora.complete_rx(rx_params, receiving_buffer).await;
+            }
+            match result {
                 Ok((received_len, rx_pkt_status)) => {
                     Ok((
                         received_len as usize,

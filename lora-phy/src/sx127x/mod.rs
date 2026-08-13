@@ -584,6 +584,15 @@ where
                 }
             }
             RadioMode::Receive(RxMode::Continuous) | RadioMode::Receive(RxMode::Single(_)) => {
+                // CRCError before RxDone: a packet whose payload CRC failed
+                // raises *both*, and its bytes are still sitting in the FIFO.
+                // Reporting Done for it hands the caller a corrupt frame that
+                // looks received, with nothing in PacketStatus to tell the
+                // difference.
+                if IrqMask::CRCError.is_set_in(irq_flags) {
+                    debug!("CRCError in radio mode {}", radio_mode);
+                    return Err(RadioError::CrcError);
+                }
                 if (irq_flags & IrqMask::RxDone.value()) == IrqMask::RxDone.value() {
                     debug!("RxDone in radio mode {}", radio_mode);
                     return Ok(Some(IrqState::Done));
