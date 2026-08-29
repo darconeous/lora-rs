@@ -26,8 +26,13 @@ const SX126X_PLL_STEP_SCALED: u32 = SX126X_XTAL_FREQ >> (25 - SX126X_PLL_STEP_SH
 // Maximum value for parameter symbNum
 const SX126X_MAX_LORA_SYMB_NUM_TIMEOUT: u8 = 248;
 
-// Time required for the TCXO to wakeup [ms].
-const BRD_TCXO_WAKEUP_TIME: u32 = 10;
+// Settling allowance granted to the TCXO each time the chip starts its
+// oscillator [ms] — the timeout argument of SetDIO3AsTCXOCtrl, paid on
+// every RX/TX start and on every RX-duty-cycle wake, so it prices each
+// sniff window. 5 ms matches RadioLib's default (the value Meshtastic
+// and MeshCore ship on the same TCXO modules); typical TCXOs stabilize
+// well under it.
+const BRD_TCXO_WAKEUP_TIME: u32 = 5;
 
 // SetRx timeout argument for enabling continuous mode
 const RX_CONTINUOUS_TIMEOUT: u32 = 0xffffff;
