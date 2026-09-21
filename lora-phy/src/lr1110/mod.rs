@@ -1540,10 +1540,11 @@ where
         self.intf.iv.reset(delay).await
     }
 
-    async fn ensure_ready(&mut self, _mode: RadioMode) -> Result<(), RadioError> {
-        // LR1110 has no BUSY pin, so just return Ok
-        // The radio is always ready to accept commands after previous command completes
-        Ok(())
+    async fn ensure_ready(&mut self, mode: RadioMode) -> Result<(), RadioError> {
+        match mode {
+            RadioMode::Sleep | RadioMode::Receive(RxMode::DutyCycle(_)) => self.intf.wakeup().await,
+            _ => self.intf.iv.wait_on_busy().await,
+        }
     }
 
     async fn set_standby(&mut self) -> Result<(), RadioError> {
@@ -1570,7 +1571,8 @@ where
             0x00,
             0x00, // sleep_time LSB
         ];
-        self.write_command(&cmd).await?;
+        // BUSY stays asserted in sleep; do not wait for it after SetSleep.
+        self.intf.write(&cmd, true).await?;
         delay.delay_ms(2).await;
 
         Ok(())
