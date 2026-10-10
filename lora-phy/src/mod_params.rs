@@ -40,12 +40,84 @@ pub enum RadioError {
 }
 
 /// Status for a received packet
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt-03", derive(defmt::Format))]
-#[allow(missing_docs)]
 pub struct PacketStatus {
+    /// Packet RSSI in dBm. On SX126x and LR11xx this is the total in-band
+    /// power, signal plus noise.
     pub rssi: i16,
+    /// SNR in dB, rounded to the nearest dB.
     pub snr: i16,
+    /// SNR in quarter-dB steps, as measured by the radio.
+    pub snr_quarter_db: i16,
+    /// Estimated signal-only RSSI in dBm, for radios that measure it
+    /// separately from [`rssi`](Self::rssi) (SX126x and LR11xx).
+    pub signal_rssi: Option<i16>,
+}
+
+/// Round an SNR in quarter-dB steps to whole dB, halves rounding up.
+pub(crate) const fn quarter_db_to_db(quarter_db: i16) -> i16 {
+    (quarter_db + 2) >> 2
+}
+
+/// Parse the three-byte LoRa packet status shared by the SX126x
+/// `GetPacketStatus` and the LR11xx `GetPacketStatus` commands:
+/// `RssiPkt`, `SnrPkt`, `SignalRssiPkt`.
+pub(crate) const fn lora_packet_status_from_bytes(bytes: [u8; 3]) -> PacketStatus {
+    let snr_quarter_db = bytes[1] as i8 as i16;
+    PacketStatus {
+        rssi: half_db_to_dbm(bytes[0]),
+        snr: quarter_db_to_db(snr_quarter_db),
+        snr_quarter_db,
+        signal_rssi: Some(half_db_to_dbm(bytes[2])),
+    }
+}
+
+/// Convert a `-raw / 2` dBm reading to whole dBm, rounding down.
+const fn half_db_to_dbm(raw: u8) -> i16 {
+    (-(raw as i16)) >> 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quarter_db_rounds_to_nearest_db() {
+        assert_eq!(quarter_db_to_db(0), 0);
+        assert_eq!(quarter_db_to_db(1), 0);
+        assert_eq!(quarter_db_to_db(2), 1);
+        assert_eq!(quarter_db_to_db(3), 1);
+        assert_eq!(quarter_db_to_db(-1), 0);
+        assert_eq!(quarter_db_to_db(-2), 0);
+        assert_eq!(quarter_db_to_db(-3), -1);
+        assert_eq!(quarter_db_to_db(-30), -7);
+        assert_eq!(quarter_db_to_db(-128), -32);
+        assert_eq!(quarter_db_to_db(126), 32);
+        assert_eq!(quarter_db_to_db(127), 32);
+    }
+
+    #[test]
+    fn lora_packet_status_keeps_quarter_db_and_signal_rssi() {
+        // RssiPkt 0xF0 = -120 dBm, SnrPkt 0xE2 = -30 steps = -7.5 dB,
+        // SignalRssiPkt 0xF7 = -123.5 dBm.
+        let status = lora_packet_status_from_bytes([0xF0, 0xE2, 0xF7]);
+        assert_eq!(
+            status,
+            PacketStatus {
+                rssi: -120,
+                snr: -7,
+                snr_quarter_db: -30,
+                signal_rssi: Some(-124)
+            }
+        );
+    }
+
+    #[test]
+    fn lora_packet_status_handles_extreme_snr() {
+        assert_eq!(lora_packet_status_from_bytes([0, 0x7F, 0]).snr, 32);
+        assert_eq!(lora_packet_status_from_bytes([0, 0x80, 0]).snr, -32);
+    }
 }
 
 /// The state of the radio

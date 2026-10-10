@@ -694,12 +694,7 @@ where
         if OpStatusErrorMask::is_error(read_status) {
             return Err(RadioError::OpError(read_status));
         }
-        // check this ???
-        let rssi = ((-(pkt_status[0] as i32)) >> 1) as i16;
-        let snr = (((pkt_status[1] as i8) + 2) >> 2) as i16;
-        let _signal_rssi = ((-(pkt_status[2] as i32)) >> 1) as i16; // unused currently
-
-        Ok(PacketStatus { rssi, snr })
+        Ok(lora_packet_status_from_bytes(pkt_status))
     }
 
     async fn get_rssi(&mut self) -> Result<i16, RadioError> {
@@ -843,7 +838,7 @@ where
                 // raises *both*, and its bytes are still sitting in the chip's
                 // buffer. Reporting Done first makes the CRC branch below
                 // unreachable and hands the caller a corrupt frame that looks
-                // received — PacketStatus carries only RSSI and SNR, so
+                // received—PacketStatus carries no CRC verdict, so
                 // nothing downstream can tell the difference.
                 //
                 // The failed packet's bytes stay in the chip's buffer and

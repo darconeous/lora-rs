@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 - sx126x: Fix IRQ processing order to handle Timeout before Preamble
 - sx127x: Switch to integer math for frequency handling
 - Make defmt optional
+- `PacketStatus` reports the SNR in quarter-dB steps (`snr_quarter_db`) and, on sx126x and lr1110, the signal-only RSSI (`signal_rssi`)
+- sx127x: Round packet SNR to the nearest dB instead of truncating it
+- sx126x, lr1110: Fix arithmetic overflow on packet SNR near +32 dB
 
 ## [v3.0.1] - 2024-07-01
 

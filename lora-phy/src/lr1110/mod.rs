@@ -1879,12 +1879,7 @@ where
         let mut pkt_status = [0u8; 3];
         self.read_command(&cmd, &mut pkt_status).await?;
 
-        // RSSI = -pkt_status[0] / 2
-        let rssi = ((-(pkt_status[0] as i32)) >> 1) as i16;
-        // SNR = (pkt_status[1] + 2) / 4
-        let snr = (((pkt_status[1] as i8) + 2) >> 2) as i16;
-
-        Ok(PacketStatus { rssi, snr })
+        Ok(lora_packet_status_from_bytes(pkt_status))
     }
 
     async fn get_rssi(&mut self) -> Result<i16, RadioError> {
@@ -2014,7 +2009,7 @@ where
                 // raises *both*, and its bytes are still sitting in the chip's
                 // buffer. Reporting Done first makes the CRC branch below
                 // unreachable and hands the caller a corrupt frame that looks
-                // received — PacketStatus carries only RSSI and SNR, so
+                // received—PacketStatus carries no CRC verdict, so
                 // nothing downstream can tell the difference.
                 //
                 // The failed packet's bytes stay in the chip's buffer and

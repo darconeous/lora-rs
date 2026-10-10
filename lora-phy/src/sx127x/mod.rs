@@ -50,6 +50,16 @@ fn linearize_rssi(rssi: u8) -> i16 {
     (rssi as i16 * 16 + (DIVISOR / 2)) / DIVISOR
 }
 
+// Packet RSSI from RegPktRssiValue, corrected by the packet SNR below 0 dB
+// (datasheet: Packet RSSI = offset + PacketRssi + PacketSnr * 0.25)
+fn packet_rssi(rssi_offset: i16, packet_rssi: u8, snr_quarter_db: i16) -> i16 {
+    if snr_quarter_db >= 0 {
+        rssi_offset + linearize_rssi(packet_rssi)
+    } else {
+        rssi_offset + packet_rssi as i16 + quarter_db_to_db(snr_quarter_db)
+    }
+}
+
 /// Configuration for SX127x-based boards
 pub struct Config<C: Sx127xVariant> {
     /// LoRa chip used on specific board
@@ -461,24 +471,16 @@ where
     }
 
     async fn get_rx_packet_status(&mut self) -> Result<PacketStatus, RadioError> {
-        let snr = {
-            let packet_snr = self.read_register(Register::RegPktSnrValue).await?;
-            packet_snr as i8 as i16 / 4
-        };
+        let snr_quarter_db = self.read_register(Register::RegPktSnrValue).await? as i8 as i16;
+        let raw_rssi = self.read_register(Register::RegPktRssiValue).await?;
+        let rssi_offset = C::rssi_offset(self).await?;
 
-        let rssi = {
-            let packet_rssi = self.read_register(Register::RegPktRssiValue).await?;
-
-            let rssi_offset = C::rssi_offset(self).await?;
-
-            if snr >= 0 {
-                rssi_offset + linearize_rssi(packet_rssi)
-            } else {
-                rssi_offset + (packet_rssi as i16) + snr
-            }
-        };
-
-        Ok(PacketStatus { rssi, snr })
+        Ok(PacketStatus {
+            rssi: packet_rssi(rssi_offset, raw_rssi, snr_quarter_db),
+            snr: quarter_db_to_db(snr_quarter_db),
+            snr_quarter_db,
+            signal_rssi: None,
+        })
     }
 
     async fn get_rssi(&mut self) -> Result<i16, RadioError> {
@@ -702,5 +704,23 @@ mod tests {
                 assert!(error.abs() < DELTA);
             }
         }
+    }
+
+    #[test]
+    fn packet_rssi_rounds_negative_snr_correction() {
+        // -7.5 dB rounds up to -7; -7.75 dB rounds to -8, where truncating
+        // gave -7.
+        assert_eq!(
+            packet_rssi(SX1276_RSSI_OFFSET_HF, 40, -30),
+            SX1276_RSSI_OFFSET_HF + 40 - 7
+        );
+        assert_eq!(
+            packet_rssi(SX1276_RSSI_OFFSET_HF, 40, -31),
+            SX1276_RSSI_OFFSET_HF + 40 - 8
+        );
+        assert_eq!(
+            packet_rssi(SX1276_RSSI_OFFSET_HF, 40, 4),
+            SX1276_RSSI_OFFSET_HF + linearize_rssi(40)
+        );
     }
 }
