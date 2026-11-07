@@ -66,17 +66,36 @@ where
 {
     /// Build and return a new instance of the LoRa physical layer API with a specified sync word
     pub async fn with_syncword(radio_kind: RK, sync_word: u8, delay: DLY) -> Result<Self, RadioError> {
-        let mut lora = Self {
+        let mut lora = Self::uninitialized_with_syncword(radio_kind, sync_word, delay);
+        lora.init().await?;
+
+        Ok(lora)
+    }
+
+    /// Build an instance without touching the radio, for LoRaWAN public or
+    /// private network. Call [`LoRa::init()`] before anything else.
+    ///
+    /// Unlike [`LoRa::new()`], a failed initialization leaves the caller
+    /// holding the radio, so it can call [`LoRa::init()`] again.
+    pub fn uninitialized(radio_kind: RK, enable_public_network: bool, delay: DLY) -> Self {
+        let sync_word = if enable_public_network {
+            LORAWAN_PUBLIC_SYNCWORD
+        } else {
+            LORAWAN_PRIVATE_SYNCWORD
+        };
+        Self::uninitialized_with_syncword(radio_kind, sync_word, delay)
+    }
+
+    /// [`LoRa::uninitialized()`] with a specified sync word.
+    pub fn uninitialized_with_syncword(radio_kind: RK, sync_word: u8, delay: DLY) -> Self {
+        Self {
             radio_kind,
             delay,
             radio_mode: RadioMode::Sleep,
             sync_word,
             cold_start: true,
             calibrate_image: true,
-        };
-        lora.init().await?;
-
-        Ok(lora)
+        }
     }
 
     /// Build and return a new instance of the LoRa physical layer API to
